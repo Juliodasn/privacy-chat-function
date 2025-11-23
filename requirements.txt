@@ -51,3 +51,9 @@ typing-extensions==4.12.2
     #   openai
     #   pydantic
     #   pydantic-core
+
+# Added for file parsing
+pandas>=2.2.2
+openpyxl>=3.1.5
+python-docx>=0.8.11
+pdfminer.six>=20231228

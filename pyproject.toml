@@ -9,6 +9,10 @@ dependencies = [
     "openai>=1.52.2",
     "pip>=24.2",
     "python-dotenv>=1.0.1",
+    "pandas>=2.2",
+    "openpyxl>=3.1",        # xlsx
+    "python-docx>=0.8.11",  # docx
+    "pdfminer.six>=20231228" # pdf
 ]
 
 [tool.uv]

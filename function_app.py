@@ -2,10 +2,13 @@ import azure.functions as func
 from src import UserThread
 from src.defs import *
 
+import AvaliacaoDataMapping as avaliacao_dm
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 ut = UserThread()
 
 
+# -------------------- CHAT --------------------
 @app.route(route="ask", methods=[func.HttpMethod.POST])
 def ask(req: func.HttpRequest) -> func.HttpResponse:
     body = req.get_json()
@@ -47,6 +50,7 @@ def get_thread(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         return JsonErrorResponse(e)
 
+
 @app.route(route="thread", methods=[func.HttpMethod.DELETE])
 def clear_thread(req: func.HttpRequest) -> func.HttpResponse:
     thread_id = req.params.get("thread-id", None) or req.form.get("thread-id", None)
@@ -61,3 +65,15 @@ def clear_thread(req: func.HttpRequest) -> func.HttpResponse:
         return JsonErrorResponse(e.message, e.status_code)
     except Exception as e:
         return JsonErrorResponse(e)
+
+
+# ----------------- AVALIAÇÃO DATA MAPPING -----------------
+# Deixo esta rota ANONYMOUS para o front consumir sem chave.
+@app.route(
+    route="avaliar-data-mapping",
+    methods=[func.HttpMethod.POST],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+def avaliar_data_mapping(req: func.HttpRequest) -> func.HttpResponse:
+    # delega para a função main do package AvaliacaoDataMapping
+    return avaliacao_dm.main(req)
