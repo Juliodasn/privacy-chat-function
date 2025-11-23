@@ -195,16 +195,42 @@ def rate_limit_allow(req: func.HttpRequest, max_requests: int = RATE_LIMIT_MAX, 
     return True, ip, 0
 # --- FIM RATE LIMIT ---
 
-def _cors_headers():
-    return {
-        "Access-Control-Allow-Origin": os.getenv("CORS_ALLOW_ORIGIN", "*"),
+def _request_origin(req: func.HttpRequest | None) -> str | None:
+    try:
+        return (req.headers.get("Origin") or req.headers.get("origin") or "").strip()
+    except Exception:
+        return None
+
+
+def _cors_headers(origin: str | None = None):
+    allowed_raw = [o.strip() for o in (os.getenv("CORS_ALLOW_ORIGIN", "*").split(",")) if o.strip()]
+    allowed_raw = allowed_raw or ["*"]
+    allowed_norm = [o.rstrip("/") for o in allowed_raw]
+    origin_norm = (origin or "").rstrip("/")
+    allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
+
+    allow_value = "*"
+    if allow_credentials:
+        if origin_norm and (origin_norm in allowed_norm or "*" in allowed_norm):
+            allow_value = origin or origin_norm
+        else:
+            allow_value = next((o for o in allowed_raw if o != "*"), allowed_raw[0])
+    else:
+        allow_value = "*" if "*" in allowed_norm else allowed_raw[0]
+
+    headers = {
+        "Access-Control-Allow-Origin": allow_value,
         "Access-Control-Allow-Headers": "Content-Type, X-Requested-With",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Expose-Headers": "Retry-After",
     }
+    if allow_credentials and allow_value != "*":
+        headers["Access-Control-Allow-Credentials"] = "true"
+    return headers
 
-def _json_response(payload: dict, status: int = 200, extra_headers: dict | None = None):
-    hdrs = _cors_headers()
+
+def _json_response(payload: dict, status: int = 200, extra_headers: dict | None = None, origin: str | None = None):
+    hdrs = _cors_headers(origin)
     if extra_headers:
         hdrs.update(extra_headers)
     return func.HttpResponse(
@@ -1922,8 +1948,9 @@ def _invert_segment_map_to_hits(by_segment: Dict[str, List[str]]) -> Dict[str, L
     return inv
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
+    req_origin = _request_origin(req)
     if (req.method or "").upper() == "OPTIONS":
-        return func.HttpResponse(status_code=204, headers=_cors_headers())
+        return func.HttpResponse(status_code=204, headers=_cors_headers(req_origin))
 
     ok, ip, retry_after = rate_limit_allow(req)
     if not ok:
@@ -1936,7 +1963,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "retry_after_seconds": retry_after
             },
             status=429,
-            extra_headers={"Retry-After": str(retry_after)}
+            extra_headers={"Retry-After": str(retry_after)},
+            origin=req_origin
         )
 
     # ---- A partir daqui, o fluxo normal fica dentro de um try global ----
@@ -1947,13 +1975,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning("FORM PARSE ERROR: %s", ve)
             return _json_response(
                 {"error": "invalid_form_data", "message": str(ve)},
-                status=400
+                status=400,
+                origin=req_origin
             )
         except Exception as ex:
             logging.exception("FORM PARSE FAILURE")
             return _json_response(
                 {"error": "invalid_form_data", "message": "Erro ao ler o formulário."},
-                status=400
+                status=400,
+                origin=req_origin
             )
 
         name_lower = (filename or "").lower()
@@ -1963,7 +1993,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "error": "Formato .doc (Word antigo) nÃƒÂ£o suportado.",
                     "hint": "Envie .docx, .pdf ou .xlsx."
                 }),
-                status_code=415, mimetype="application/json"
+                status_code=415,
+                mimetype="application/json",
+                headers=_cors_headers(req_origin)
             )
 
         text_norm, structured = extract_text_from_bytes(filename, file_bytes)
@@ -2151,13 +2183,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             }
         }
 
-        return func.HttpResponse(json.dumps(payload, ensure_ascii=False),
-                                 status_code=200, mimetype="application/json")
+        return _json_response(payload, status=200, origin=req_origin)
 
     except ValueError as ve:
-        return func.HttpResponse(json.dumps({"error": str(ve)}),
-                                 status_code=400, mimetype="application/json")
+        return _json_response({"error": str(ve)}, status=400, origin=req_origin)
     except Exception as ex:
         logging.exception("Erro geral na função")
-        return func.HttpResponse(json.dumps({"error": str(ex)}),
-                                 status_code=500, mimetype="application/json")
+        return _json_response({"error": str(ex)}, status=500, origin=req_origin)
