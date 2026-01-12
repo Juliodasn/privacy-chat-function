@@ -1958,7 +1958,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response(
             {
                 "error": "Limite de uso atingido",
-                "message": "Você pode enviar no máximo 3 avaliações por IP a cada 24 horas.",
+                "message": "Você pode enviar no máximo 3 avaliações a cada 24 horas.",
                 "ip": ip,
                 "retry_after_seconds": retry_after
             },
