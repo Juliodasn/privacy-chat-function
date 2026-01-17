@@ -9,7 +9,13 @@ ut = UserThread()
 
 
 # -------------------- CHAT --------------------
-@app.route(route="ask", methods=[func.HttpMethod.POST])
+@app.route(
+    route="ask",
+    methods=[func.HttpMethod.POST],
+    # Para o front consumir direto pelo browser sem expor function key.
+    # Em producao, considere proteger via API Gateway / auth propria.
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
 def ask(req: func.HttpRequest) -> func.HttpResponse:
     body = req.get_json()
     message = body.get("message", None)
@@ -30,7 +36,11 @@ def ask(req: func.HttpRequest) -> func.HttpResponse:
         return JsonErrorResponse(e)
 
 
-@app.route(route="thread", methods=[func.HttpMethod.GET])
+@app.route(
+    route="thread",
+    methods=[func.HttpMethod.GET],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
 def get_thread(req: func.HttpRequest) -> func.HttpResponse:
     thread_id = req.params.get("thread-id", None)
 
@@ -51,7 +61,11 @@ def get_thread(req: func.HttpRequest) -> func.HttpResponse:
         return JsonErrorResponse(e)
 
 
-@app.route(route="thread", methods=[func.HttpMethod.DELETE])
+@app.route(
+    route="thread",
+    methods=[func.HttpMethod.DELETE],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
 def clear_thread(req: func.HttpRequest) -> func.HttpResponse:
     thread_id = req.params.get("thread-id", None) or req.form.get("thread-id", None)
 
