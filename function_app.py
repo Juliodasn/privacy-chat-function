@@ -1,4 +1,6 @@
 import os
+import json
+import logging
 import azure.functions as func
 from src import UserThread
 from src.defs import *
@@ -11,11 +13,24 @@ ut = UserThread()
 # -------------------- CORS --------------------
 # Lista de origens permitidas (separa por vírgula)
 # Ex: "https://homologa.privacypoint.com.br,https://privacypoint.com.br,http://localhost:3000"
-CORS_ALLOWED_ORIGINS = {
-    o.strip()
-    for o in os.getenv("CORS_ALLOWED_ORIGINS", "https://homologa.privacypoint.com.br").split(",")
-    if o.strip()
-}
+# Suporta 2 formatos:
+# 1) CSV: "https://a,https://b"
+# 2) JSON array: ["https://a","https://b"]
+def _parse_allowed_origins() -> set[str]:
+    raw = (os.getenv("CORS_ALLOWED_ORIGINS") or "https://homologa.privacypoint.com.br").strip()
+    if not raw:
+        return set()
+    if raw.lstrip().startswith("["):
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, list):
+                return {str(o).strip() for o in arr if str(o).strip()}
+        except Exception:
+            # cai para o fallback CSV
+            pass
+    return {o.strip() for o in raw.split(",") if o.strip()}
+
+CORS_ALLOWED_ORIGINS = _parse_allowed_origins()
 
 
 def _cors_headers(req: func.HttpRequest) -> dict:
@@ -39,6 +54,29 @@ def _apply_cors(req: func.HttpRequest, resp: func.HttpResponse) -> func.HttpResp
     return resp
 
 
+def _read_json_body(req: func.HttpRequest) -> dict:
+    """Parseia JSON do body de forma mais tolerante (inclusive BOM UTF-8).
+    Levanta Exception se não conseguir parsear.
+    """
+    raw = req.get_body() or b""
+    if not raw:
+        raise ValueError("Empty request body")
+
+    # utf-8-sig remove BOM se vier de arquivos gerados no Windows (Out-File etc.)
+    try:
+        text = raw.decode("utf-8-sig")
+    except Exception:
+        text = raw.decode("utf-8", errors="replace")
+
+    # Alguns clientes podem mandar whitespace antes do JSON
+    text = text.strip()
+
+    if not text:
+        raise ValueError("Empty request body")
+
+    return json.loads(text)
+
+
 # -------------------- CHAT --------------------
 @app.route(
     route="ask",
@@ -51,8 +89,15 @@ def ask(req: func.HttpRequest) -> func.HttpResponse:
         return EmptyResponse(status_code=204, headers=_cors_headers(req))
 
     try:
-        body = req.get_json()
-    except Exception:
+        body = _read_json_body(req)
+    except Exception as e:
+        # Loga diagnóstico no App Insights / logs do host
+        try:
+            raw = req.get_body() or b""
+            preview = raw[:200]
+        except Exception:
+            preview = b""
+        logging.exception("Falha ao parsear JSON. content-type=%s body_preview=%r", req.headers.get('content-type'), preview)
         return JsonErrorResponse("Invalid JSON body.", 400, headers=_cors_headers(req))
 
     message = body.get("message", None)
