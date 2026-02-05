@@ -8,6 +8,10 @@ anyio==4.6.2.post1
     #   openai
 azure-functions==1.21.3
     # via chatfunc (pyproject.toml)
+azure-functions-durable==1.2.2
+    # via chatfunc (pyproject.toml)
+azure-storage-blob==12.19.1
+    # via chatfunc (pyproject.toml)
 certifi==2024.8.30
     # via
     #   httpcore
