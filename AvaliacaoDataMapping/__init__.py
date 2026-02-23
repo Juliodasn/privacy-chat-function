@@ -2,12 +2,14 @@
 import io, os, re, json, unicodedata, csv
 from typing import Tuple, List, Dict, Optional
 import logging, sys
+from datetime import date
 
 import hashlib, time, tempfile
 from collections import Counter
 
 from dotenv import load_dotenv
 import openai
+from .rag_engine import build_chunks, build_rag_index, chunk_text_for_llm, evaluate_questions_with_rag
 
 load_dotenv()
 
@@ -23,6 +25,97 @@ try:
     LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "60000"))
 except Exception:
     LLM_MAX_CHARS = 60000
+try:
+    _rag_top_k_env = int(os.getenv("RAG_TOP_K", "4"))
+except Exception:
+    _rag_top_k_env = 4
+RAG_TOP_K = max(1, min(_rag_top_k_env, 6))
+_legacy_use_rag_preview = os.getenv("USE_RAG_PREVIEW", "false").lower() == "true"
+_legacy_use_rag_complement = os.getenv("USE_RAG_COMPLEMENT", "false").lower() == "true"
+RAG_ENABLED = os.getenv(
+    "RAG_ENABLED",
+    "true" if (_legacy_use_rag_preview or _legacy_use_rag_complement) else "false",
+).lower() == "true"
+RAG_ONLY_FILL_MISSING = os.getenv("RAG_ONLY_FILL_MISSING", "true").lower() == "true"
+RAG_FALLBACK_TO_OLD_LLM = os.getenv("RAG_FALLBACK_TO_OLD_LLM", "true").lower() == "true"
+RAG_EVAL_MODEL = os.getenv("RAG_EVAL_MODEL", OPENAI_MODEL)
+RAG_ROLLOUT_STAGE = (os.getenv("RAG_ROLLOUT_STAGE", "manual") or "manual").strip().lower()
+RAG_AUTO_CUTOVER_DATE = (os.getenv("RAG_AUTO_CUTOVER_DATE", "") or "").strip()
+
+
+def _is_cutover_date_reached(raw_date: str) -> bool:
+    if not raw_date:
+        return False
+    try:
+        y, m, d = [int(p) for p in raw_date.split("-")]
+        return date.today() >= date(y, m, d)
+    except Exception:
+        return False
+
+
+if RAG_ROLLOUT_STAGE in ("legacy", "old_only"):
+    RAG_ENABLED = False
+    RAG_ONLY_FILL_MISSING = True
+    RAG_FALLBACK_TO_OLD_LLM = True
+elif RAG_ROLLOUT_STAGE in ("shadow", "preview"):
+    RAG_ENABLED = True
+    RAG_ONLY_FILL_MISSING = True
+    RAG_FALLBACK_TO_OLD_LLM = True
+elif RAG_ROLLOUT_STAGE in ("hybrid", "safe"):
+    RAG_ENABLED = True
+    RAG_ONLY_FILL_MISSING = True
+    RAG_FALLBACK_TO_OLD_LLM = False
+elif RAG_ROLLOUT_STAGE in ("rag_primary", "full"):
+    RAG_ENABLED = True
+    RAG_ONLY_FILL_MISSING = False
+    RAG_FALLBACK_TO_OLD_LLM = False
+
+if _is_cutover_date_reached(RAG_AUTO_CUTOVER_DATE):
+    RAG_ENABLED = True
+    RAG_FALLBACK_TO_OLD_LLM = False
+
+
+def _rag_config_snapshot() -> dict:
+    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip()
+    azure_key = (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY") or "").strip()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    provider = "none"
+    if endpoint and azure_key:
+        provider = "azure_openai"
+    elif openai_key:
+        provider = "openai"
+
+    embed_model = (
+        os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+        or os.getenv("RAG_EMBEDDING_MODEL")
+        or os.getenv("OPENAI_EMBEDDING_MODEL")
+        or ""
+    ).strip()
+    issues: List[str] = []
+    if RAG_ENABLED:
+        if provider == "none":
+            issues.append("RAG enabled without provider credentials")
+        if provider == "azure_openai":
+            if not (os.getenv("AZURE_OPENAI_API_VERSION") or "").strip():
+                issues.append("AZURE_OPENAI_API_VERSION is missing")
+        if not (RAG_EVAL_MODEL or "").strip():
+            issues.append("RAG_EVAL_MODEL is missing")
+        if not embed_model:
+            issues.append("Embedding deployment/model is missing")
+    return {
+        "enabled": bool(RAG_ENABLED),
+        "provider": provider,
+        "rollout_stage": RAG_ROLLOUT_STAGE,
+        "config_ok": len(issues) == 0,
+        "issues": issues,
+        "has_chat_model": bool((RAG_EVAL_MODEL or "").strip()),
+        "has_embedding_model": bool(embed_model),
+    }
+
+
+_RAG_CONFIG = _rag_config_snapshot()
+if RAG_ENABLED and not _RAG_CONFIG.get("config_ok", False):
+    logging.warning("RAG CONFIG WARNING: %s", _RAG_CONFIG.get("issues", []))
 
 
 STRICT_MODE = os.getenv("STRICT_MODE", "true").lower() == "true"
@@ -109,7 +202,7 @@ _PERSONAL_ONLY_KEYWORDS = [
     "apenas dados pessoais",
     "only personal data",
 ]
-RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "3")) # Limite de requisição
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30")) # Limite de requisição
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", str(24 * 60 * 60)))
 
 _RATE_FILE = os.path.join(tempfile.gettempdir(), "pp_rate_limit.json")
@@ -498,6 +591,11 @@ SISTEMAS_QTEXT = [
 AREAS_QMAP     = _list_to_question_map(AREAS_15, AREAS_QTEXT)
 PROCESSOS_QMAP = _list_to_question_map(PROCESSOS_26, PROCESSOS_QTEXT)
 SISTEMAS_QMAP  = _list_to_question_map(SISTEMAS_5, SISTEMAS_QTEXT)
+QUESTION_SECTION_BY_CODE = {
+    **{code: "areas" for code in AREAS_QMAP.keys()},
+    **{code: "processos" for code in PROCESSOS_QMAP.keys()},
+    **{code: "sistemas" for code in SISTEMAS_QMAP.keys()},
+}
 
 
 def _slots_respondidos_por_media(df, excluir_cols, total_slots):
@@ -1620,31 +1718,41 @@ def llm_evaluate_document(text_for_llm: str) -> dict:
         "sistemas":  {"map": {k: 0 for k in SISTEMAS_QMAP.keys()},  "hits": {}, "total": 5,  "answered": 0},
     }
 
-    chunk_size = LLM_CHUNK_SIZE
-    chunks = [text_for_llm[i:i+chunk_size] for i in range(0, len(text_for_llm), chunk_size)] or [""]
+    def _refresh_answered() -> None:
+        for sec in ["areas", "processos", "sistemas"]:
+            m = agg[sec]["map"]
+            agg[sec]["answered"] = int(sum(1 for v in m.values() if v))
+
+    chunks = chunk_text_for_llm(text_for_llm, LLM_CHUNK_SIZE)
+    logging.info("RAG/LLM chunking: chunks=%s chunk_size=%s", len(chunks), LLM_CHUNK_SIZE)
     passes = 2 if LLM_DOUBLE_PASS else 1
 
     for chunk_idx, ch in enumerate(chunks, start=1):
         pass_results = {"areas": [], "processos": [], "sistemas": []}
         for _ in range(passes):
-            pass_results["areas"].append(_normalize_group_result(_eval_group_once("Áreas", AREAS_QMAP, ch), AREAS_QMAP))
-            pass_results["processos"].append(_normalize_group_result(_eval_group_once("processos", PROCESSOS_QMAP, ch), PROCESSOS_QMAP))
-            pass_results["sistemas"].append(_normalize_group_result(_eval_group_once("sistemas", SISTEMAS_QMAP, ch), SISTEMAS_QMAP))
+            if agg["areas"]["answered"] < agg["areas"]["total"]:
+                pass_results["areas"].append(_normalize_group_result(_eval_group_once("Áreas", AREAS_QMAP, ch), AREAS_QMAP))
+            if agg["processos"]["answered"] < agg["processos"]["total"]:
+                pass_results["processos"].append(_normalize_group_result(_eval_group_once("processos", PROCESSOS_QMAP, ch), PROCESSOS_QMAP))
+            if agg["sistemas"]["answered"] < agg["sistemas"]["total"]:
+                pass_results["sistemas"].append(_normalize_group_result(_eval_group_once("sistemas", SISTEMAS_QMAP, ch), SISTEMAS_QMAP))
 
-        inter_a = _reduce_pass_results(pass_results["areas"])
-        inter_p = _reduce_pass_results(pass_results["processos"])
-        inter_s = _reduce_pass_results(pass_results["sistemas"])
+        if pass_results["areas"]:
+            inter_a = _reduce_pass_results(pass_results["areas"])
+            _merge_union(agg["areas"], inter_a)
+        if pass_results["processos"]:
+            inter_p = _reduce_pass_results(pass_results["processos"])
+            _merge_union(agg["processos"], inter_p)
+        if pass_results["sistemas"]:
+            inter_s = _reduce_pass_results(pass_results["sistemas"])
+            _merge_union(agg["sistemas"], inter_s)
 
-        _merge_union(agg["areas"],     inter_a)
-        _merge_union(agg["processos"], inter_p)
-        _merge_union(agg["sistemas"],  inter_s)
+        _refresh_answered()
         if all(agg[sec]["answered"] >= agg[sec]["total"] for sec in ["areas", "processos", "sistemas"]):
             logging.info("LLM early stop after chunk %s/%s (all sections answered)", chunk_idx, len(chunks))
             break
 
-    for sec in ["areas", "processos", "sistemas"]:
-        m = agg[sec]["map"]
-        agg[sec]["answered"] = int(sum(1 for v in m.values() if v))
+    _refresh_answered()
 
     return agg
 
@@ -1922,13 +2030,24 @@ def _build_per_question_report(
     llm_map: Dict[str, int],
     llm_hits: Dict[str, List[str]],
     col_map: Optional[Dict[str, int]] = None,
-    col_hits: Optional[Dict[str, List[str]]] = None
+    col_hits: Optional[Dict[str, List[str]]] = None,
+    rag_results: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Dict]:
     rep: Dict[str, Dict] = {}
     kw_set = set(keyword_hits_list or [])
     col_map = col_map or {}
     col_hits = col_hits or {}
+    rag_results = rag_results or {}
     for code, question_text in qmap.items():
+        rag_row = rag_results.get(code) or {}
+        rag_chunks_min = []
+        for ch in (rag_row.get("rag_chunks") or []):
+            rag_chunks_min.append(
+                {
+                    "chunk_id": ch.get("chunk_id"),
+                    "score": round(float(ch.get("score", 0.0)), 6),
+                }
+            )
         rep[code] = {
             "question": question_text,
             "keyword_hit": (code in kw_set),              # ficarÃƒÂ¡ False com STRICT_MODE
@@ -1937,6 +2056,11 @@ def _build_per_question_report(
             "evidence": (llm_hits or {}).get(code, [])[:2],
             "col": int(col_map.get(code, 0)),
             "evidence_col": (col_hits or {}).get(code, [])[:2],
+            "rag": int((rag_row.get("answerable", 0) in (1, True))),
+            "rag_evidence": (rag_row.get("evidence") or [])[:2],
+            "rag_chunks": rag_chunks_min,
+            "rag_reason": rag_row.get("reason"),
+            "rag_used_chunk_ids": (rag_row.get("used_chunk_ids") or [])[:4],
         }
     return rep
 
@@ -1946,6 +2070,154 @@ def _invert_segment_map_to_hits(by_segment: Dict[str, List[str]]) -> Dict[str, L
         for code in codes:
             inv.setdefault(code, []).append(seg)
     return inv
+
+
+def _questions_missing_in_column_truth(qmap: Dict[str, str], col_map: Dict[str, int]) -> List[Tuple[str, str]]:
+    return [(code, qtxt) for code, qtxt in qmap.items() if int((col_map or {}).get(code, 0)) == 0]
+
+
+def _apply_rag_complement_to_llm(
+    col_map: Dict[str, int],
+    llm_map: Dict[str, int],
+    llm_hits: Dict[str, List[str]],
+    rag_results: Dict[str, Dict],
+) -> int:
+    applied = 0
+    for code, rag_row in (rag_results or {}).items():
+        if int((col_map or {}).get(code, 0)) == 1:
+            continue
+        if int((llm_map or {}).get(code, 0)) == 1:
+            continue
+        if int(rag_row.get("answerable", 0)) != 1:
+            continue
+
+        llm_map[code] = 1
+        applied += 1
+        for ev in (rag_row.get("evidence") or []):
+            sev = str(ev).strip()
+            if not sev:
+                continue
+            llm_hits.setdefault(code, [])
+            if sev[:240] not in llm_hits[code] and len(llm_hits[code]) < 2:
+                llm_hits[code].append(sev[:240])
+    return applied
+
+# =========================
+# Compat helper p/ Durable
+# =========================
+def evaluate_data_mapping_payload(organograma: str, filename: str, file_bytes: bytes) -> dict:
+    """
+    Wrapper de compatibilidade para uso pelo function_app.py (Durable Activity).
+    Ele reaproveita o fluxo HTTP existente (main(req)), simulando um multipart/form-data,
+    e devolve o JSON (dict) em vez de HttpResponse.
+    """
+    import uuid
+    import json as _json
+
+    class _FakeReq:
+        def __init__(self, method: str, headers: dict, body: bytes):
+            self.method = method
+            self.headers = headers
+            self._body = body
+
+        def get_body(self) -> bytes:
+            return self._body
+
+    def _build_multipart_formdata(organograma_value: str, file_name: str, content: bytes):
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+        crlf = b"\r\n"
+
+        # Campo "organograma"
+        part_organograma = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="organograma"\r\n\r\n'
+            f"{organograma_value or 'nao'}\r\n"
+        ).encode("utf-8")
+
+        # Campo "file"
+        part_file_header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{file_name or "arquivo.bin"}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+
+        end = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        body = part_organograma + part_file_header + (content or b"") + end
+        content_type = f"multipart/form-data; boundary={boundary}"
+        return content_type, body
+
+    # Monta requisição fake multipart
+    content_type, body = _build_multipart_formdata(organograma, filename, file_bytes)
+    fake_req = _FakeReq(
+        method="POST",
+        headers={
+            "content-type": content_type,
+            "origin": "http://localhost:3000",
+            "x-forwarded-for": "127.0.0.1",
+        },
+        body=body,
+    )
+
+    # Evita aplicar rate-limit no processamento interno da Durable Activity
+    _old_rate_limit_allow = globals().get("rate_limit_allow")
+    try:
+        if callable(_old_rate_limit_allow):
+            globals()["rate_limit_allow"] = lambda req: (True, "internal-durable", 0)
+
+        resp = main(fake_req)  # reutiliza TODO o fluxo atual (incluindo RAG)
+    finally:
+        if callable(_old_rate_limit_allow):
+            globals()["rate_limit_allow"] = _old_rate_limit_allow
+
+    # Tenta converter HttpResponse => dict
+    status_code = getattr(resp, "status_code", 200)
+    raw = b""
+    try:
+        raw = resp.get_body() if hasattr(resp, "get_body") else b""
+    except Exception:
+        raw = b""
+
+    text = ""
+    try:
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        text = ""
+
+    try:
+        data = _json.loads(text) if text else {}
+    except Exception:
+        data = {"raw_response": text}
+
+    if status_code >= 400:
+        # Levanta erro para o Durable marcar como falha e salvar error.json
+        msg = data.get("message") or data.get("error") or f"Falha na avaliação (HTTP {status_code})"
+        raise Exception(msg)
+
+    return data
+
+
+
+def _compare_old_llm_vs_rag(qmap: Dict[str, str], llm_map: Dict[str, int], rag_results: Dict[str, Dict]) -> Dict[str, object]:
+    compared = 0
+    agrees = 0
+    diverged: List[str] = []
+    for code in qmap.keys():
+        if code not in (rag_results or {}):
+            continue
+        compared += 1
+        old_bit = 1 if int((llm_map or {}).get(code, 0)) == 1 else 0
+        rag_bit = 1 if int(((rag_results or {}).get(code, {}) or {}).get("answerable", 0)) == 1 else 0
+        if old_bit == rag_bit:
+            agrees += 1
+        else:
+            diverged.append(code)
+    return {
+        "compared": compared,
+        "agree": agrees,
+        "disagree": max(0, compared - agrees),
+        "diverged_codes": diverged[:12],
+    }
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     req_origin = _request_origin(req)
@@ -2003,8 +2275,45 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.info("ENV DEBUG: py=%s has_pandas=%s", sys.executable, bool(pd))
         logging.info("STRUCT DEBUG: keys=%s", list(structured.keys()) if isinstance(structured, dict) else None)
         raw_text = structured.get("__raw_text__", "") if isinstance(structured, dict) else ""
+        rag_chunks = []
+        rag_index = None
+        rag_results_areas: Dict[str, Dict] = {}
+        rag_results_proc: Dict[str, Dict] = {}
+        rag_results_sist: Dict[str, Dict] = {}
+        rag_meta_by_section: Dict[str, Dict] = {}
+        rag_applied = {"areas": 0, "processos": 0, "sistemas": 0}
+        llm_old_used = False
+        llm_old_elapsed_ms = 0
 
-        # 0) Verdade por TAG (coluna/aba)
+        # 0) Base RAG (controlada por feature flag)
+        if RAG_ENABLED:
+            try:
+                rag_chunks = build_chunks(text_norm, structured)
+                rag_index = build_rag_index(
+                    text_norm,
+                    structured,
+                    chunks=rag_chunks,
+                    question_sections=QUESTION_SECTION_BY_CODE,
+                    embed_chunks=True,
+                )
+                if isinstance(structured, dict):
+                    structured["__rag_chunks__"] = rag_chunks
+                    structured["__rag_index__"] = rag_index
+                logging.info(
+                    "RAG METRICS: chunks=%s has_embeddings=%s provider=%s model=%s section_counts=%s embed_ms=%s",
+                    len(rag_chunks),
+                    bool((rag_index or {}).get("has_embeddings")),
+                    (rag_index or {}).get("embedding_provider"),
+                    (rag_index or {}).get("embedding_model"),
+                    rag_index.get("section_counts", {}),
+                    (rag_index or {}).get("embed_elapsed_ms"),
+                )
+            except Exception as rag_err:
+                logging.exception("RAG DEBUG: falha ao preparar base (%s)", rag_err)
+        else:
+            logging.info("RAG disabled via feature flag (RAG_ENABLED=false)")
+
+        # 0.1) Verdade por TAG (coluna/aba)
         col_based = evaluate_by_columns(structured)
         sensitive_scan = _detect_sensitive_data_usage(structured if isinstance(structured, dict) else None)
 
@@ -2057,11 +2366,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         llm_hits_areas = {}
         llm_hits_proc  = {}
         llm_hits_sist  = {}
+        run_old_llm = bool(USE_LLM_EVAL and text_norm and (not RAG_ENABLED or RAG_FALLBACK_TO_OLD_LLM))
         try:
             text_for_llm = structured.get("__raw_text_src__") if isinstance(structured, dict) else None
             text_for_llm = _clip_text_for_llm(text_for_llm or text_norm)
-            if USE_LLM_EVAL and text_for_llm:
+            if run_old_llm and text_for_llm:
+                llm_started = time.time()
                 llm = llm_evaluate_document(text_for_llm)
+                llm_old_elapsed_ms = int((time.time() - llm_started) * 1000)
+                llm_old_used = True
                 llm_map_areas = llm.get("areas", {}).get("map", {}) or {}
                 llm_map_proc  = llm.get("processos", {}).get("map", {}) or {}
                 llm_map_sist  = llm.get("sistemas", {}).get("map", {}) or {}
@@ -2080,6 +2393,67 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             if int(llm_map_proc.get("3_trata_dados_sensiveis", 0)) == 1:
                 llm_map_proc["3_trata_dados_sensiveis"] = 0
                 llm_hits_proc.pop("3_trata_dados_sensiveis", None)
+
+        llm_map_areas_old = dict(llm_map_areas)
+        llm_map_proc_old = dict(llm_map_proc)
+        llm_map_sist_old = dict(llm_map_sist)
+
+        col_map_areas = (col_based.get("areas", {}) or {}).get("map", {})
+        col_map_proc = (col_based.get("processos", {}) or {}).get("map", {})
+        col_map_sist = (col_based.get("sistemas", {}) or {}).get("map", {})
+        col_hits_areas = (col_based.get("areas", {}) or {}).get("hits", {})
+        col_hits_proc = (col_based.get("processos", {}) or {}).get("hits", {})
+        col_hits_sist = (col_based.get("sistemas", {}) or {}).get("hits", {})
+
+        rag_mode_active = bool(RAG_ENABLED and isinstance(rag_index, dict) and bool((rag_index or {}).get("has_embeddings")))
+        if rag_mode_active and isinstance(rag_index, dict) and bool((rag_index or {}).get("has_embeddings")):
+            try:
+                sec_inputs = [
+                    ("areas", AREAS_QMAP, col_map_areas),
+                    ("processos", PROCESSOS_QMAP, col_map_proc),
+                    ("sistemas", SISTEMAS_QMAP, col_map_sist),
+                ]
+                for sec, qmap, cmap in sec_inputs:
+                    questions_for_rag = (
+                        _questions_missing_in_column_truth(qmap, cmap)
+                        if RAG_ONLY_FILL_MISSING
+                        else list(qmap.items())
+                    )
+                    if not questions_for_rag:
+                        rag_meta_by_section[sec] = {"evaluated": 0}
+                        continue
+                    rag_eval = evaluate_questions_with_rag(
+                        questions_for_rag,
+                        rag_index,
+                        top_k=RAG_TOP_K,
+                        model=RAG_EVAL_MODEL,
+                    ) or {}
+                    results = (rag_eval.get("results") or {}) if isinstance(rag_eval, dict) else {}
+                    meta = (rag_eval.get("meta") or {}) if isinstance(rag_eval, dict) else {}
+                    rag_meta_by_section[sec] = meta
+                    logging.info(
+                        "RAG METRICS: section=%s evaluated=%s retrieval_ms=%s llm_calls=%s llm_ms_total=%s elapsed_ms=%s",
+                        sec,
+                        meta.get("evaluated"),
+                        meta.get("retrieval_ms_total"),
+                        meta.get("llm_calls"),
+                        meta.get("llm_ms_total"),
+                        meta.get("elapsed_ms"),
+                    )
+                    if sec == "areas":
+                        rag_results_areas = results
+                    elif sec == "processos":
+                        rag_results_proc = results
+                    else:
+                        rag_results_sist = results
+            except Exception as rag_eval_err:
+                logging.exception("RAG SAFE MODE: falha na avaliacao por perguntas (%s)", rag_eval_err)
+
+        if RAG_ENABLED:
+            rag_applied["areas"] = _apply_rag_complement_to_llm(col_map_areas, llm_map_areas, llm_hits_areas, rag_results_areas)
+            rag_applied["processos"] = _apply_rag_complement_to_llm(col_map_proc, llm_map_proc, llm_hits_proc, rag_results_proc)
+            rag_applied["sistemas"] = _apply_rag_complement_to_llm(col_map_sist, llm_map_sist, llm_hits_sist, rag_results_sist)
+            logging.info("RAG SAFE MODE: complementos aplicados=%s", rag_applied)
         # 2.1) Merge da VERDADE por TAG (sobrepÃƒÂµe contagem base)
         def _merge_column_truth(base: dict, sec: str):
             col = col_based.get(sec) or {}
@@ -2103,22 +2477,25 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         perq_areas = _build_per_question_report(
             AREAS_QMAP, list(kw_hits_areas), seg_by_code_areas,
             llm_map_areas, llm_hits_areas,
-            col_map=(col_based.get("areas", {}) or {}).get("map", {}),
-            col_hits=(col_based.get("areas", {}) or {}).get("hits", {})
+            col_map=col_map_areas,
+            col_hits=col_hits_areas,
+            rag_results=rag_results_areas,
         )
 
         perq_proc = _build_per_question_report(
             PROCESSOS_QMAP, list(kw_hits_proc), seg_by_code_proc,
             llm_map_proc, llm_hits_proc,
-            col_map=(col_based.get("processos", {}) or {}).get("map", {}),
-            col_hits=(col_based.get("processos", {}) or {}).get("hits", {})
+            col_map=col_map_proc,
+            col_hits=col_hits_proc,
+            rag_results=rag_results_proc,
         )
 
         perq_sist = _build_per_question_report(
             SISTEMAS_QMAP, list(kw_hits_sist), seg_by_code_sist,
             llm_map_sist, llm_hits_sist,
-            col_map=(col_based.get("sistemas", {}) or {}).get("map", {}),
-            col_hits=(col_based.get("sistemas", {}) or {}).get("hits", {})
+            col_map=col_map_sist,
+            col_hits=col_hits_sist,
+            rag_results=rag_results_sist,
         )
 
         areas_final     = _compute_answered_from_per_question(perq_areas, 15)
@@ -2135,6 +2512,45 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.info("FALTANTES AREAS: %s", sorted(missing_areas))
         logging.info("FALTANTES PROCESSOS: %s", sorted(missing_proc))
         logging.info("FALTANTES SISTEMAS: %s", sorted(missing_sist))
+
+        rag_vs_old = {
+            "areas": _compare_old_llm_vs_rag(AREAS_QMAP, llm_map_areas_old, rag_results_areas),
+            "processos": _compare_old_llm_vs_rag(PROCESSOS_QMAP, llm_map_proc_old, rag_results_proc),
+            "sistemas": _compare_old_llm_vs_rag(SISTEMAS_QMAP, llm_map_sist_old, rag_results_sist),
+        }
+
+        rag_preview = {
+            "enabled": bool(RAG_ENABLED),
+            "mode": "fill_missing_only" if RAG_ONLY_FILL_MISSING else "all_non_column",
+            "top_k": RAG_TOP_K,
+            "model": RAG_EVAL_MODEL,
+            "rollout_stage": RAG_ROLLOUT_STAGE,
+            "auto_cutover_date": RAG_AUTO_CUTOVER_DATE,
+            "fallback_to_old_llm": bool(RAG_FALLBACK_TO_OLD_LLM),
+            "old_llm_used": bool(llm_old_used),
+            "old_llm_elapsed_ms": int(llm_old_elapsed_ms),
+            "old_vs_rag": rag_vs_old,
+            "by_section": {
+                "areas": {
+                    "evaluated": len(rag_results_areas),
+                    "answerable": int(sum(1 for r in rag_results_areas.values() if int(r.get("answerable", 0)) == 1)),
+                    "applied_to_missing": int(rag_applied.get("areas", 0)),
+                    "meta": rag_meta_by_section.get("areas", {}),
+                },
+                "processos": {
+                    "evaluated": len(rag_results_proc),
+                    "answerable": int(sum(1 for r in rag_results_proc.values() if int(r.get("answerable", 0)) == 1)),
+                    "applied_to_missing": int(rag_applied.get("processos", 0)),
+                    "meta": rag_meta_by_section.get("processos", {}),
+                },
+                "sistemas": {
+                    "evaluated": len(rag_results_sist),
+                    "answerable": int(sum(1 for r in rag_results_sist.values() if int(r.get("answerable", 0)) == 1)),
+                    "applied_to_missing": int(rag_applied.get("sistemas", 0)),
+                    "meta": rag_meta_by_section.get("sistemas", {}),
+                },
+            },
+        }
 
         total_respondidas = (1 if organograma == "sim" else 0) + areas_final["answered"] + processos_final["answered"] + sistemas_final["answered"]
         total_perguntas  = 1 + areas_final["total"] + processos_final["total"] + sistemas_final["total"]
@@ -2179,6 +2595,31 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "areas": sorted(missing_areas),
                     "processos": sorted(missing_proc),
                     "sistemas": sorted(missing_sist)
+                },
+                "rag": {
+                    "enabled": isinstance(rag_index, dict),
+                    "chunk_count": int((rag_index or {}).get("chunk_count", 0)) if isinstance(rag_index, dict) else 0,
+                    "has_embeddings": bool((rag_index or {}).get("has_embeddings")) if isinstance(rag_index, dict) else False,
+                    "embedding_provider": (rag_index or {}).get("embedding_provider") if isinstance(rag_index, dict) else None,
+                    "embedding_model": (rag_index or {}).get("embedding_model") if isinstance(rag_index, dict) else None,
+                    "embedding_elapsed_ms": int((rag_index or {}).get("embed_elapsed_ms", 0)) if isinstance(rag_index, dict) else 0,
+                    "top_k": RAG_TOP_K,
+                    "feature_flags": {
+                        "RAG_ENABLED": bool(RAG_ENABLED),
+                        "RAG_ONLY_FILL_MISSING": bool(RAG_ONLY_FILL_MISSING),
+                        "RAG_FALLBACK_TO_OLD_LLM": bool(RAG_FALLBACK_TO_OLD_LLM),
+                        "RAG_ROLLOUT_STAGE": RAG_ROLLOUT_STAGE,
+                        "RAG_AUTO_CUTOVER_DATE": RAG_AUTO_CUTOVER_DATE,
+                    },
+                    "config": dict(_RAG_CONFIG),
+                    "old_llm_used": bool(llm_old_used),
+                    "old_llm_elapsed_ms": int(llm_old_elapsed_ms),
+                },
+                "rag_preview": rag_preview,
+                "rag_applied_missing": {
+                    "areas": int(rag_applied.get("areas", 0)),
+                    "processos": int(rag_applied.get("processos", 0)),
+                    "sistemas": int(rag_applied.get("sistemas", 0)),
                 }
             }
         }
@@ -2190,3 +2631,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as ex:
         logging.exception("Erro geral na função")
         return _json_response({"error": str(ex)}, status=500, origin=req_origin)
+

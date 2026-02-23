@@ -66,3 +66,53 @@ Para executar a função localmente:
 
 Para desenvolvimento, recomenda-se usar o Visual Studio Code com as extensões
 Azure Functions e Python.
+
+## RAG Rollout (Avaliacao Data Mapping)
+
+Feature flags principais:
+- `RAG_ENABLED` (default: `false`)
+- `RAG_ONLY_FILL_MISSING` (default: `true`)
+- `RAG_FALLBACK_TO_OLD_LLM` (default: `true`)
+- `RAG_ROLLOUT_STAGE` (opcional: `manual|legacy|shadow|hybrid|rag_primary`)
+- `RAG_AUTO_CUTOVER_DATE` (opcional, formato `YYYY-MM-DD`; desliga fallback ao atingir a data)
+- `RAG_TOP_K` (default: `4`)
+- `RAG_QUESTION_BATCH_SIZE` (default: `6`, faixa recomendada `2-8`)
+- `RAG_CONTEXT_MAX_CHARS` (default: `12000`)
+- `RAG_CONTEXT_MAX_TOKENS` (default: `3000`)
+- `RAG_EVAL_MODEL` (default: `OPENAI_MODEL`)
+
+Rollout sugerido:
+1. `RAG_ENABLED=true` e `RAG_FALLBACK_TO_OLD_LLM=true` para operar com fallback.
+2. Validar divergencias em amostra real usando o script abaixo.
+3. Quando estabilizar, manter `RAG_ENABLED=true` e trocar para `RAG_FALLBACK_TO_OLD_LLM=false`.
+
+Comparacao old vs RAG (10 arquivos):
+```bash
+python Backend/scripts/compare_old_vs_rag.py "C:\\caminho\\amostra" --limit 10 --top-k 4
+```
+
+Teste automatizado RAG (local/CI):
+```bash
+python -m unittest discover -s Backend/tests -p "test_*.py" -v
+```
+
+Validacao de config/deployments (chat + embedding):
+```bash
+python Backend/scripts/validate_rag_config.py --local-settings Backend/local.settings.json
+```
+
+Aplicar settings RAG na Function App (Azure):
+```powershell
+.\Backend\scripts\set_azure_rag_appsettings.ps1 `
+  -ResourceGroup "<rg>" `
+  -FunctionAppName "<function-app>" `
+  -AzureOpenAIEndpoint "https://<recurso>.openai.azure.com/" `
+  -AzureOpenAIApiKey "<key>" `
+  -ChatDeployment "<deployment-chat>" `
+  -EmbeddingDeployment "<deployment-embedding>"
+```
+
+Check rapido de erros comuns:
+- `401/403`: chave invalida ou sem permissao no recurso Azure OpenAI.
+- `404`: deployment de chat/embedding incorreto.
+- `400`: `AZURE_OPENAI_API_VERSION` incompativel com o endpoint/deployment.

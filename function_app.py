@@ -88,11 +88,30 @@ DM_INPUT_CONTAINER = os.getenv("DM_INPUT_CONTAINER", "dm-inputs")
 DM_RESULT_CONTAINER = os.getenv("DM_RESULT_CONTAINER", "dm-results")
 
 
-def _get_blob_service_client() -> BlobServiceClient:
-    conn = os.getenv("AzureWebJobsStorage")
+def _resolve_storage_connection_string() -> str:
+    conn = (os.getenv("AzureWebJobsStorage") or "").strip()
     if not conn:
         raise ValueError("AzureWebJobsStorage is not configured.")
+
+    # Suporte explícito ao shortcut do Azurite em ambiente local
+    if conn.lower() == "usedevelopmentstorage=true":
+        return (
+            "DefaultEndpointsProtocol=http;"
+            "AccountName=devstoreaccount1;"
+            "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
+            "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+            "QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;"
+            "TableEndpoint=http://127.0.0.1:10002/devstoreaccount1;"
+        )
+
+    return conn
+
+
+def _get_blob_service_client() -> BlobServiceClient:
+    conn = _resolve_storage_connection_string()
     return BlobServiceClient.from_connection_string(conn)
+
+
 
 
 def _ensure_container(name: str):
@@ -209,59 +228,50 @@ def ask(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(
     route="thread",
-    methods=[func.HttpMethod.GET, func.HttpMethod.OPTIONS],
+    methods=[func.HttpMethod.GET, func.HttpMethod.DELETE, func.HttpMethod.OPTIONS],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
-def get_thread(req: func.HttpRequest) -> func.HttpResponse:
+def thread(req: func.HttpRequest) -> func.HttpResponse:
     # Preflight (CORS)
     if req.method == "OPTIONS":
         return EmptyResponse(status_code=204, headers=_cors_headers(req))
 
-    thread_id = req.params.get("thread-id", None)
+    if req.method == "GET":
+        thread_id = req.params.get("thread-id", None)
+        if thread_id is None:
+            return JsonErrorResponse("Thread ID is required", 400, headers=_cors_headers(req))
 
-    if thread_id is None:
-        return JsonErrorResponse("Thread ID is required", 400, headers=_cors_headers(req))
+        asc = req.params.get("order", "desc").lower() == "asc"
 
-    asc = req.params.get("order", "desc").lower() == "asc"
+        try:
+            messages = ut.list_messages(thread_id, asc=asc)
+            return JsonResponse(
+                {
+                    "thread-id": thread_id,
+                    "messages": messages,
+                },
+                200,
+                headers=_cors_headers(req),
+            )
+        except StatusCodeError as e:
+            return JsonErrorResponse(e.message, e.status_code, headers=_cors_headers(req))
+        except Exception as e:
+            return JsonErrorResponse(e, headers=_cors_headers(req))
 
-    try:
-        messages = ut.list_messages(thread_id, asc=asc)
-        return JsonResponse(
-            {
-                "thread-id": thread_id,
-                "messages": messages,
-            },
-            200,
-            headers=_cors_headers(req),
-        )
-    except StatusCodeError as e:
-        return JsonErrorResponse(e.message, e.status_code, headers=_cors_headers(req))
-    except Exception as e:
-        return JsonErrorResponse(e, headers=_cors_headers(req))
+    if req.method == "DELETE":
+        thread_id = req.params.get("thread-id", None) or req.form.get("thread-id", None)
+        if thread_id is None:
+            return JsonErrorResponse("Thread ID is required", 400, headers=_cors_headers(req))
 
+        try:
+            ut.delete_thread(thread_id)
+            return EmptyResponse(status_code=200, headers=_cors_headers(req))
+        except StatusCodeError as e:
+            return JsonErrorResponse(e.message, e.status_code, headers=_cors_headers(req))
+        except Exception as e:
+            return JsonErrorResponse(e, headers=_cors_headers(req))
 
-@app.route(
-    route="thread",
-    methods=[func.HttpMethod.DELETE, func.HttpMethod.OPTIONS],
-    auth_level=func.AuthLevel.ANONYMOUS,
-)
-def clear_thread(req: func.HttpRequest) -> func.HttpResponse:
-    # Preflight (CORS)
-    if req.method == "OPTIONS":
-        return EmptyResponse(status_code=204, headers=_cors_headers(req))
-
-    thread_id = req.params.get("thread-id", None) or req.form.get("thread-id", None)
-
-    if thread_id is None:
-        return JsonErrorResponse("Thread ID is required", 400, headers=_cors_headers(req))
-
-    try:
-        ut.delete_thread(thread_id)
-        return EmptyResponse(status_code=200, headers=_cors_headers(req))
-    except StatusCodeError as e:
-        return JsonErrorResponse(e.message, e.status_code, headers=_cors_headers(req))
-    except Exception as e:
-        return JsonErrorResponse(e, headers=_cors_headers(req))
+    return JsonErrorResponse("Method not allowed", 405, headers=_cors_headers(req))
 
 
 # ----------------- AVALIAÇÃO DATA MAPPING -----------------
