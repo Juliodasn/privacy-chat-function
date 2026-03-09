@@ -116,3 +116,33 @@ Check rapido de erros comuns:
 - `401/403`: chave invalida ou sem permissao no recurso Azure OpenAI.
 - `404`: deployment de chat/embedding incorreto.
 - `400`: `AZURE_OPENAI_API_VERSION` incompativel com o endpoint/deployment.
+
+## Respondibilidade (QA Blocks + Hybrid Retrieval)
+
+Ordem de decisao por pergunta:
+1. `qa_block` (parser deterministico por ancoras)
+2. `rag` (embedding + lexical rerank)
+3. `col_llm` (regras por coluna/LLM legado)
+
+Campos novos no `debug` da resposta:
+- `qa_blocks.found`
+- `qa_blocks.anchors_found`
+- `retrieval.<secao>.<question_code>.before_rerank`
+- `retrieval.<secao>.<question_code>.after_rerank`
+
+Campos por pergunta (`debug.per_question`):
+- `answerable`
+- `answerable_source` (`qa_block|rag|col_llm`)
+- `evidence`
+- `used_chunk_ids`
+- `reason` (quando `answerable=0`)
+
+Hardening de respondibilidade (zero falso-positivo):
+- `answerable=1` so quando existe evidencia explicita + rastreavel.
+- Evidencia que e pergunta/header/label ou texto generico e descartada.
+- Em `STRICT_MODE=true`, RAG nao pode auto-atribuir chunk quando o modelo nao enviar `used_chunk_ids`.
+- Em RAG, evidencia precisa existir literalmente no texto do chunk usado.
+
+Variaveis de ambiente uteis para rerank:
+- `RAG_RETRIEVAL_EMBED_TOP_K` (default: `12`)
+- `RAG_RETRIEVAL_ALPHA` (default: `0.65`)

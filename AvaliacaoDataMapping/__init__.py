@@ -1,15 +1,52 @@
-﻿import azure.functions as func
 import io, os, re, json, unicodedata, csv
-from typing import Tuple, List, Dict, Optional
+from typing import Any, Tuple, List, Dict, Optional
 import logging, sys
 from datetime import date
-
+import re
+from typing import Iterable, List
 import hashlib, time, tempfile
 from collections import Counter
 
 from dotenv import load_dotenv
 import openai
 from .rag_engine import build_chunks, build_rag_index, chunk_text_for_llm, evaluate_questions_with_rag
+from .anchors_catalog import ANCHORS as QA_ANCHORS_CATALOG, QUESTION_ANCHOR_MAP, QUESTION_KEYWORDS as HYBRID_QUESTION_KEYWORDS
+from .qa_blocks import extract_qa_blocks, resolve_question_from_qa_blocks
+from .answerability_guard import bump_metric, is_too_generic, looks_like_prompt
+
+try:
+    import azure.functions as func
+except Exception:
+    class _HttpRequestFallback:
+        def __init__(self, headers=None, body: bytes | None = None):
+            self.headers = headers or {}
+            self._body = body or b""
+
+        def get_body(self) -> bytes:
+            return self._body
+
+    class _HttpResponseFallback:
+        def __init__(
+            self,
+            body: Any = b"",
+            status_code: int = 200,
+            mimetype: str | None = None,
+            headers: Dict[str, str] | None = None,
+        ):
+            payload = body if isinstance(body, (bytes, bytearray)) else str(body or "").encode("utf-8")
+            self._body = bytes(payload)
+            self.status_code = int(status_code)
+            self.mimetype = mimetype
+            self.headers = headers or {}
+
+        def get_body(self) -> bytes:
+            return self._body
+
+    class _FuncFallback:
+        HttpRequest = _HttpRequestFallback
+        HttpResponse = _HttpResponseFallback
+
+    func = _FuncFallback()  # type: ignore[assignment]
 
 load_dotenv()
 
@@ -119,6 +156,74 @@ if RAG_ENABLED and not _RAG_CONFIG.get("config_ok", False):
 
 
 STRICT_MODE = os.getenv("STRICT_MODE", "true").lower() == "true"
+
+def _normalize_text(value: str) -> str:
+    if not value:
+        return ""
+    value = value.lower().strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _contains_any_anchor(text: str, anchors: Iterable[str]) -> bool:
+    text_norm = _normalize_text(text)
+    for anchor in anchors:
+        if _normalize_text(anchor) in text_norm:
+            return True
+    return False
+
+
+def _collect_texts_from_chunks(chunks: List[dict]) -> List[str]:
+    texts = []
+    for chunk in chunks or []:
+        if isinstance(chunk, dict):
+            txt = chunk.get("text") or chunk.get("content") or chunk.get("chunk_text") or ""
+            if txt:
+                texts.append(str(txt))
+        elif isinstance(chunk, str):
+            texts.append(chunk)
+    return texts
+
+
+def enforce_explicit_answerability(question_code: str, result: dict) -> dict:
+    """
+    Rebaixa answerable=1 para 0 quando a pergunta exige prova textual explícita,
+    mas o resultado veio apenas por similaridade genérica/RAG frouxo.
+    """
+    if question_code not in STRICT_EXPLICIT_ANSWERABILITY:
+        return result
+
+    if not result or int(result.get("answerable", 0)) != 1:
+        return result
+
+    anchors = QUESTION_EXPLICIT_ANCHORS.get(question_code, [])
+    if not anchors:
+        return result
+
+    candidate_texts = []
+
+    candidate_texts.extend(result.get("rag_evidence") or [])
+    candidate_texts.extend(result.get("qa_evidence") or [])
+    candidate_texts.extend(result.get("llm_evidence") or [])
+    candidate_texts.extend(result.get("evidence") or [])
+
+    rag_chunks = result.get("rag_chunks") or []
+    candidate_texts.extend(_collect_texts_from_chunks(rag_chunks))
+
+    has_explicit_anchor = any(_contains_any_anchor(text, anchors) for text in candidate_texts if text)
+
+    if has_explicit_anchor:
+        return result
+
+    result["answerable"] = 0
+    result["used_chunk_ids"] = []
+    result["answerable_source"] = "strict_explicit_guard"
+    result["reason"] = "missing_explicit_anchor_for_question"
+
+    if "rag_reason" in result and result.get("rag_reason") == "schema_table_value_present":
+        result["rag_reason"] = "blocked_by_strict_explicit_guard"
+
+    return result
 
 _ANALYSIS_CACHE_KEY = "__pp_analysis_cache__"
 _SENSITIVE_CACHE_ENTRY = "process_sensitive_eval"
@@ -1002,19 +1107,204 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, dict]:
 
 
 def _answer_bit(row: Dict) -> int:
-    if STRICT_MODE:
-        return 1 if int(row.get("col", 0)) == 1 or int(row.get("llm", 0)) == 1 else 0
-    else:
-        return 1 if (row.get("keyword_hit") or (row.get("segments") and len(row["segments"]) > 0) or int(row.get("llm", 0)) == 1) else 0
+    reason = str(
+        row.get("qa_reason")
+        or row.get("rag_reason")
+        or row.get("reason")
+        or ""
+    ).strip().lower()
 
-def _compute_answered_from_per_question(perq: Dict[str, Dict], total_expected: int) -> dict:
+    negative_reasons = {
+        "not_answerable",
+        "no_retrieved_context",
+        "no_context_after_limit",
+        "no_context_for_question_after_limit",
+        "no_context_after_guard",
+        "no_explicit_evidence",
+        "no_evidence_explicit",
+        "no_anchor_mapping",
+        "no_filled_anchor_answer",
+        "no_schema_evidence",
+        "schema_free_text_not_specific",
+        "filtered_evidence_empty",
+        "strict_missing_chunk_trace",
+        "missing_chunk_trace",
+        "evidence_is_prompt",
+        "prompt_only_evidence",
+    }
+
+    if reason in negative_reasons:
+        return 0
+
+    if reason.startswith("não há") or reason.startswith("nao ha"):
+        return 0
+
+    return 1 if int(row.get("col", 0)) == 1 or int(row.get("llm", 0)) == 1 else 0
+
+def _merge_audit_evidence(
+    *evidence_groups: List[str],
+    question_text: str = "",
+    guard_stats: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    merged: List[str] = []
+    for group in evidence_groups:
+        for item in group or []:
+            txt = str(item).strip()
+            if not txt:
+                continue
+            if looks_like_prompt(txt, question_text=question_text):
+                if guard_stats is not None:
+                    guard_stats["guard_drop_prompt_evidence_count"] = int(guard_stats.get("guard_drop_prompt_evidence_count", 0)) + 1
+                continue
+            if is_too_generic(txt):
+                if guard_stats is not None:
+                    guard_stats["guard_drop_generic_evidence_count"] = int(guard_stats.get("guard_drop_generic_evidence_count", 0)) + 1
+                continue
+            clipped = txt[:240]
+            if clipped not in merged:
+                merged.append(clipped)
+            if len(merged) >= 2:
+                return merged
+    return merged
+
+
+def _normalize_used_chunk_ids(ids: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in ids or []:
+        txt = str(item).strip()
+        if not txt or txt in out:
+            continue
+        out.append(txt[:120])
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _compute_answered_from_per_question(
+    perq: Dict[str, Dict],
+    total_expected: int,
+    rag_primary: bool = False,
+) -> dict:
     by_code = {}
+    guard_stats: Dict[str, int] = {
+        "guard_drop_prompt_evidence_count": 0,
+        "guard_drop_generic_evidence_count": 0,
+        "guard_drop_missing_chunk_count": 0,
+        "guard_drop_evidence_not_in_chunk_count": 0,
+    }
+
     for code, row in perq.items():
-        by_code[code] = _answer_bit(row)
+        bit = 0
+        reason = ""
+        source = "col_llm"
+        evidence: List[str] = []
+        used_chunk_ids: List[str] = []
+
+        if int(row.get("qa", 0)) == 1:
+            bit = 1
+            source = "qa_block"
+            evidence = _merge_audit_evidence(
+                (row.get("qa_evidence") or [])[:2],
+                question_text=str(row.get("question") or ""),
+                guard_stats=guard_stats,
+            )
+            used_chunk_ids = _normalize_used_chunk_ids((row.get("qa_used_chunk_ids") or [])[:4])
+            reason = str(row.get("qa_reason") or "").strip()
+        elif int(row.get("rag", 0)) == 1 and (rag_primary or int(row.get("col", 0)) == 0):
+            bit = 1
+            source = "rag"
+            evidence = _merge_audit_evidence(
+                (row.get("rag_evidence") or [])[:2],
+                question_text=str(row.get("question") or ""),
+                guard_stats=guard_stats,
+            )
+            used_chunk_ids = _normalize_used_chunk_ids((row.get("rag_used_chunk_ids") or [])[:4])
+            reason = str(row.get("rag_reason") or "").strip()
+        elif rag_primary:
+            bit = 1 if int(row.get("rag", 0)) == 1 else 0
+            source = "rag"
+            evidence = _merge_audit_evidence(
+                (row.get("rag_evidence") or [])[:2],
+                question_text=str(row.get("question") or ""),
+                guard_stats=guard_stats,
+            )
+            used_chunk_ids = _normalize_used_chunk_ids((row.get("rag_used_chunk_ids") or [])[:4])
+            reason = str(row.get("rag_reason") or "").strip()
+        else:
+            reason = str(
+                row.get("qa_reason")
+                or row.get("rag_reason")
+                or row.get("reason")
+                or ""
+            ).strip()
+
+            bit = _answer_bit(row)
+            source = "col_llm"
+            evidence = _merge_audit_evidence(
+                (row.get("evidence_col") or [])[:2],
+                (row.get("llm_evidence") or [])[:2],
+                (row.get("rag_evidence") or [])[:2],
+                question_text=str(row.get("question") or ""),
+                guard_stats=guard_stats,
+            )
+
+            if int(row.get("rag", 0)) == 1:
+                used_chunk_ids = _normalize_used_chunk_ids((row.get("rag_used_chunk_ids") or [])[:4])
+            elif (row.get("evidence_col") or []):
+                used_chunk_ids = [f"col:{code}"]
+            elif (row.get("llm_evidence") or []):
+                used_chunk_ids = [f"llm:{code}"]
+
+            reason_lower = reason.lower()
+            if reason_lower in {
+                "not_answerable",
+                "no_retrieved_context",
+                "no_context_after_limit",
+                "no_context_for_question_after_limit",
+                "no_context_after_guard",
+                "no_explicit_evidence",
+                "no_evidence_explicit",
+                "no_anchor_mapping",
+                "no_filled_anchor_answer",
+                "no_schema_evidence",
+                "schema_free_text_not_specific",
+                "filtered_evidence_empty",
+                "strict_missing_chunk_trace",
+                "missing_chunk_trace",
+                "evidence_is_prompt",
+                "prompt_only_evidence",
+            } or reason_lower.startswith("não há") or reason_lower.startswith("nao ha"):
+                bit = 0
+                evidence = []
+                used_chunk_ids = []
+
+        if bit == 1 and not evidence:
+            bit = 0
+            reason = "filtered_evidence_empty"
+            used_chunk_ids = []
+        if bit == 1 and not used_chunk_ids:
+            if source == "qa_block":
+                used_chunk_ids = [f"qa:{code}:0"]
+            elif source == "rag":
+                bit = 0
+                reason = "strict_missing_chunk_trace" if STRICT_MODE else "missing_chunk_trace"
+            elif source == "col_llm":
+                used_chunk_ids = [f"col_llm:{code}"]
+        if bit == 0 and not reason:
+            reason = str(row.get("qa_reason") or row.get("rag_reason") or "not_answerable")
+        bump_metric(guard_stats, reason)
+
+        row["answerable_source"] = source
+        row["used_chunk_ids"] = _normalize_used_chunk_ids(used_chunk_ids)
+        row["evidence"] = evidence
+        row["reason"] = reason[:240]
+        row["answerable"] = bit
+        by_code[code] = bit
     return {
         "answered": int(sum(by_code.values())),
         "total": int(total_expected),
-        "by_code": by_code
+        "by_code": by_code,
+        "guard_stats": guard_stats,
     }
 
 
@@ -1106,6 +1396,24 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, dict]:
     text_norm, structured = _original_extract(filename, content)
     if isinstance(structured, dict):
         structured["__raw_text__"] = text_norm
+        try:
+            raw_text_for_qa = str(structured.get("__raw_text_src__") or text_norm or "")
+            qa_blocks, qa_index = extract_qa_blocks(
+                raw_text_for_qa,
+                anchors_catalog=QA_ANCHORS_CATALOG,
+                source="pdf_raw_text",
+            )
+            structured["qa_blocks"] = qa_blocks
+            structured["qa_index"] = qa_index
+            logging.info(
+                "QA_BLOCKS_FOUND=%s anchors=%s",
+                len(qa_blocks),
+                sorted(list((qa_index or {}).keys()))[:30],
+            )
+        except Exception as qa_err:
+            logging.exception("QA_BLOCKS extraction failed: %s", qa_err)
+            structured["qa_blocks"] = []
+            structured["qa_index"] = {}
     return text_norm, structured
 
 def _init_llm_maps() -> dict:
@@ -1152,9 +1460,16 @@ LLM_REQUIRED_SNIPPET_KEYWORDS = {
             "api",
         ],
         "6_classificacao_documentos": [
-            "classific",
-            "document",
-            "sigilo",
+            "classificacao de documentos",
+            "classificacao da informacao",
+            "classificacao documental",
+            "informacao classificada",
+            "nivel de sigilo",
+            "uso interno",
+            "documento confidencial",
+            "documento restrito",
+            "documento sigiloso",
+            "documento publico",
         ],
     },
     "processos": {
@@ -1201,13 +1516,31 @@ LLM_REQUIRED_SNIPPET_KEYWORDS = {
             "anos",
             "duracao",
         ],
-        "12_formato_dados_disponiveis": [
+                "12_formato_dados_disponiveis": [
             "formato",
             "forma",
+            "meio",
+            "suporte",
             "digital",
             "fisico",
-            "portal",
+            "papel",
+            "planilha",
+            "formulario",
+            "documento",
+            "word",
+            "pdf",
             "arquivo",
+            "pasta",
+            "email",
+            "e-mail",
+            "whatsapp",
+            "sistema",
+            "software",
+            "portal",
+            "google drive",
+            "onedrive",
+            "pen drive",
+            "nuvem",
         ],
         "17_medidas_seg_cibernetica": [
             "politica de seguranca",
@@ -1280,6 +1613,27 @@ QUESTION_CONTEXT_RULES = {
                 "inexistencia de compartilhamento na rede",
             ],
         },
+        "2_2_politica_restricao_acesso": {
+            "must_groups": [
+                ["acesso"],
+                ["gestao", "controle", "perfil", "restricao", "segregacao", "por area", "liderancas", "controller", "financeiro"],
+            ],
+            "any_keywords": [
+                "gestao de acesso",
+                "controle de acesso",
+                "perfil de acesso",
+                "acesso por area",
+                "acesso restrito",
+                "segregacao de acesso",
+                "permitido apenas",
+                "somente gestores",
+            ],
+            "neg_patterns": [
+                "sem restricao de acesso",
+                "todos acessam sem restricao",
+                "acesso irrestrito",
+            ],
+        },
         "4_1_forma_compart": {
             "must_groups": [
                 ["compart", "disponib", "envio", "repasse", "transfer", "compartilhamento"],
@@ -1306,13 +1660,19 @@ QUESTION_CONTEXT_RULES = {
         },
         "6_classificacao_documentos": {
             "must_groups": [
-                ["classific", "categoria", "nivel", "etiqueta", "sigilo"],
-                ["document", "informac", "registro", "dado"],
+                ["classific", "nivel de sigilo", "sigilo", "uso interno", "confidencial", "restrito", "publico"],
+                ["document", "informac"],
             ],
             "neg_patterns": [
                 "nao possui class",
                 "sem classificacao",
                 "nao ha classificacao",
+                "dado pessoal",
+                "dados pessoais",
+                "dado sensivel",
+                "dados sensiveis",
+                "categoria dos dados",
+                "classificacao do produto",
             ],
         },
     },
@@ -1372,8 +1732,34 @@ QUESTION_CONTEXT_RULES = {
         },
         "12_formato_dados_disponiveis": {
             "must_groups": [
-                ["formato", "forma", "meio", "suporte", "disponivel"],
-                ["digital", "fisico", "papel", "sistema", "planilha", "formulario", "arquivo", "pdf"],
+                [
+                    "digital",
+                    "fisico",
+                    "papel",
+                    "sistema",
+                    "planilha",
+                    "formulario",
+                    "arquivo",
+                    "pdf",
+                    "word",
+                    "documento",
+                    "email",
+                    "e-mail",
+                    "whatsapp",
+                    "portal",
+                    "software",
+                    "drive",
+                    "google drive",
+                    "onedrive",
+                    "pasta",
+                    "pen drive",
+                    "nuvem",
+                ],
+            ],
+            "neg_patterns": [
+                "nao informado",
+                "nao identificado",
+                "sem informacao sobre formato",
             ],
         },
         "15_dados_precisos_claros_atualizados": {
@@ -1786,6 +2172,38 @@ def _is_nonempty(val) -> bool:
     s = str(val).strip()
     return s != "" and s.lower() != "nan"
 
+
+def _is_nonempty_dataframe(df) -> bool:
+    if pd is None or df is None or not isinstance(df, pd.DataFrame):
+        return False
+    if getattr(df, "empty", True):
+        return False
+    try:
+        for row in df.itertuples(index=False, name=None):
+            for value in row:
+                if _is_nonempty(value):
+                    return True
+    except Exception:
+        return True
+    return False
+
+
+def has_structured_tables(structured: dict | None) -> bool:
+    if not isinstance(structured, dict):
+        return False
+
+    for section in ("areas", "processos", "sistemas"):
+        if _is_nonempty_dataframe(structured.get(section)):
+            return True
+
+    for row in (structured.get("__tables__") or []):
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        if _is_nonempty_dataframe(row[1]):
+            return True
+
+    return False
+
 def _parse_bool(val: str) -> Optional[bool]:
     if val is None:
         return None
@@ -1956,14 +2374,12 @@ def _sist_rule_4_contrato(structured: dict, idx: TagIndex) -> Tuple[int, List[st
     return 0, EV
 
 def _sist_rule_4_1_contrato_apresentado(structured: dict, idx: TagIndex) -> Tuple[int, List[str]]:
-    # 4.1 Ã¢â‚¬â€ contrato apresentado: [field=cli.nda] (outra evidÃƒÂªncia documental/assinado)
-    EV = []
-    for sheet, ridx, val in idx.field_values.get("cli.nda", []):
-        b = _parse_bool(val)
-        if b is True or b is False:
-            EV.append(_evidence_field_only(sheet, ridx, "cli.nda", val))
-            return 1, EV
-    return 0, EV
+    # 4.1 — contrato apresentado
+    # IMPORTANTE:
+    #   Não reutilizar cli.nda aqui. NDA/confidencialidade não prova que o contrato do sistema
+    #   foi efetivamente apresentado/anexado no documento. Como hoje não existe um field dedicado
+    #   para "contrato apresentado", a avaliação por coluna deve permanecer conservadora.
+    return 0, []
 
 
 # ---------- Tabela de regras (apenas tags, sem keywords)
@@ -2023,23 +2439,82 @@ def evaluate_by_columns(structured: dict) -> Dict[str, Dict]:
 # =========================================================
 # MAIN
 # =========================================================
+def _evaluate_by_qa_blocks(structured: dict | None) -> Dict[str, Dict]:
+    out = {
+        "areas": {"map": {}, "hits": {}, "used_ids": {}, "reasons": {}, "answered": 0, "total": len(AREAS_QMAP)},
+        "processos": {"map": {}, "hits": {}, "used_ids": {}, "reasons": {}, "answered": 0, "total": len(PROCESSOS_QMAP)},
+        "sistemas": {"map": {}, "hits": {}, "used_ids": {}, "reasons": {}, "answered": 0, "total": len(SISTEMAS_QMAP)},
+    }
+
+    qa_blocks = []
+    qa_index = {}
+    if isinstance(structured, dict):
+        qa_blocks = list(structured.get("qa_blocks") or [])
+        qa_index = dict(structured.get("qa_index") or {})
+
+    sections = [
+        ("areas", AREAS_QMAP),
+        ("processos", PROCESSOS_QMAP),
+        ("sistemas", SISTEMAS_QMAP),
+    ]
+    for section, qmap in sections:
+        answered = 0
+        for code in qmap.keys():
+            qa_res = resolve_question_from_qa_blocks(
+                code,
+                qa_blocks=qa_blocks,
+                qa_index=qa_index,
+                question_anchor_map=QUESTION_ANCHOR_MAP,
+            )
+            bit = 1 if int(qa_res.get("answerable", 0)) == 1 else 0
+            out[section]["map"][code] = bit
+            if bit == 1:
+                answered += 1
+                out[section]["hits"][code] = (qa_res.get("evidence") or [])[:2]
+                out[section]["used_ids"][code] = (qa_res.get("used_chunk_ids") or [])[:2]
+            out[section]["reasons"][code] = str(qa_res.get("reason") or "")
+        out[section]["answered"] = answered
+    return out
+
+
 def _build_per_question_report(
     qmap: Dict[str, str],
     keyword_hits_list: List[str],
     segment_by_code: Dict[str, List[str]],
     llm_map: Dict[str, int],
     llm_hits: Dict[str, List[str]],
+    qa_map: Optional[Dict[str, int]] = None,
+    qa_hits: Optional[Dict[str, List[str]]] = None,
+    qa_used_ids: Optional[Dict[str, List[str]]] = None,
+    qa_reasons: Optional[Dict[str, str]] = None,
     col_map: Optional[Dict[str, int]] = None,
     col_hits: Optional[Dict[str, List[str]]] = None,
     rag_results: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Dict]:
     rep: Dict[str, Dict] = {}
     kw_set = set(keyword_hits_list or [])
+    qa_map = qa_map or {}
+    qa_hits = qa_hits or {}
+    qa_used_ids = qa_used_ids or {}
+    qa_reasons = qa_reasons or {}
     col_map = col_map or {}
     col_hits = col_hits or {}
     rag_results = rag_results or {}
     for code, question_text in qmap.items():
         rag_row = rag_results.get(code) or {}
+        qa_answerable = int(qa_map.get(code, 0) in (1, True))
+        qa_evidence = (qa_hits.get(code) or [])[:2]
+        qa_used_chunk_ids = (qa_used_ids.get(code) or [])[:2]
+        qa_reason = str(qa_reasons.get(code) or "").strip()
+        llm_evidence = (llm_hits or {}).get(code, [])[:2]
+        column_evidence = (col_hits or {}).get(code, [])[:2]
+        rag_evidence = (rag_row.get("evidence") or [])[:2]
+        rag_used_chunk_ids = (rag_row.get("used_chunk_ids") or [])[:4]
+        rag_answerable = int((rag_row.get("answerable", 0) in (1, True)))
+        rag_reason = str(rag_row.get("reason") or "").strip()
+        if rag_answerable == 0 and not rag_reason:
+            rag_reason = "not_evaluated"
+
         rag_chunks_min = []
         for ch in (rag_row.get("rag_chunks") or []):
             rag_chunks_min.append(
@@ -2053,14 +2528,22 @@ def _build_per_question_report(
             "keyword_hit": (code in kw_set),              # ficarÃƒÂ¡ False com STRICT_MODE
             "segments": sorted(segment_by_code.get(code, [])),
             "llm": int((llm_map or {}).get(code, 0)),
-            "evidence": (llm_hits or {}).get(code, [])[:2],
+            "llm_evidence": llm_evidence,
+            "evidence": llm_evidence,
             "col": int(col_map.get(code, 0)),
-            "evidence_col": (col_hits or {}).get(code, [])[:2],
-            "rag": int((rag_row.get("answerable", 0) in (1, True))),
-            "rag_evidence": (rag_row.get("evidence") or [])[:2],
+            "evidence_col": column_evidence,
+            "qa": qa_answerable,
+            "qa_evidence": qa_evidence,
+            "qa_used_chunk_ids": qa_used_chunk_ids,
+            "qa_reason": qa_reason,
+            "rag": rag_answerable,
+            "rag_evidence": rag_evidence,
             "rag_chunks": rag_chunks_min,
-            "rag_reason": rag_row.get("reason"),
-            "rag_used_chunk_ids": (rag_row.get("used_chunk_ids") or [])[:4],
+            "rag_retrieval_debug": rag_row.get("retrieval_debug"),
+            "rag_reason": rag_reason,
+            "rag_used_chunk_ids": rag_used_chunk_ids,
+            "answerable": rag_answerable,
+            "used_chunk_ids": rag_used_chunk_ids,
         }
     return rep
 
@@ -2294,6 +2777,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     structured,
                     chunks=rag_chunks,
                     question_sections=QUESTION_SECTION_BY_CODE,
+                    question_keywords=HYBRID_QUESTION_KEYWORDS,
                     embed_chunks=True,
                 )
                 if isinstance(structured, dict):
@@ -2405,7 +2889,38 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         col_hits_proc = (col_based.get("processos", {}) or {}).get("hits", {})
         col_hits_sist = (col_based.get("sistemas", {}) or {}).get("hits", {})
 
+        qa_based = _evaluate_by_qa_blocks(structured if isinstance(structured, dict) else None)
+        qa_map_areas = (qa_based.get("areas", {}) or {}).get("map", {})
+        qa_map_proc = (qa_based.get("processos", {}) or {}).get("map", {})
+        qa_map_sist = (qa_based.get("sistemas", {}) or {}).get("map", {})
+        qa_hits_areas = (qa_based.get("areas", {}) or {}).get("hits", {})
+        qa_hits_proc = (qa_based.get("processos", {}) or {}).get("hits", {})
+        qa_hits_sist = (qa_based.get("sistemas", {}) or {}).get("hits", {})
+        qa_used_areas = (qa_based.get("areas", {}) or {}).get("used_ids", {})
+        qa_used_proc = (qa_based.get("processos", {}) or {}).get("used_ids", {})
+        qa_used_sist = (qa_based.get("sistemas", {}) or {}).get("used_ids", {})
+        qa_reason_areas = (qa_based.get("areas", {}) or {}).get("reasons", {})
+        qa_reason_proc = (qa_based.get("processos", {}) or {}).get("reasons", {})
+        qa_reason_sist = (qa_based.get("sistemas", {}) or {}).get("reasons", {})
+
+        logging.info(
+            "QA BLOCK DECISION: answered areas=%s processos=%s sistemas=%s",
+            int((qa_based.get("areas", {}) or {}).get("answered", 0)),
+            int((qa_based.get("processos", {}) or {}).get("answered", 0)),
+            int((qa_based.get("sistemas", {}) or {}).get("answered", 0)),
+        )
+
+        has_structured = has_structured_tables(structured if isinstance(structured, dict) else None)
         rag_mode_active = bool(RAG_ENABLED and isinstance(rag_index, dict) and bool((rag_index or {}).get("has_embeddings")))
+        rag_primary = bool(rag_mode_active and not has_structured)
+        logging.info(
+            "RAG_PRIMARY: %s (rag_enabled=%s has_embeddings=%s has_structured_tables=%s)",
+            rag_primary,
+            bool(RAG_ENABLED),
+            bool((rag_index or {}).get("has_embeddings")) if isinstance(rag_index, dict) else False,
+            has_structured,
+        )
+
         if rag_mode_active and isinstance(rag_index, dict) and bool((rag_index or {}).get("has_embeddings")):
             try:
                 sec_inputs = [
@@ -2414,11 +2929,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     ("sistemas", SISTEMAS_QMAP, col_map_sist),
                 ]
                 for sec, qmap, cmap in sec_inputs:
-                    questions_for_rag = (
-                        _questions_missing_in_column_truth(qmap, cmap)
-                        if RAG_ONLY_FILL_MISSING
-                        else list(qmap.items())
-                    )
+                    if rag_primary:
+                        questions_for_rag = list(qmap.items())
+                    else:
+                        questions_for_rag = (
+                            _questions_missing_in_column_truth(qmap, cmap)
+                            if RAG_ONLY_FILL_MISSING
+                            else list(qmap.items())
+                        )
                     if not questions_for_rag:
                         rag_meta_by_section[sec] = {"evaluated": 0}
                         continue
@@ -2477,6 +2995,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         perq_areas = _build_per_question_report(
             AREAS_QMAP, list(kw_hits_areas), seg_by_code_areas,
             llm_map_areas, llm_hits_areas,
+            qa_map=qa_map_areas,
+            qa_hits=qa_hits_areas,
+            qa_used_ids=qa_used_areas,
+            qa_reasons=qa_reason_areas,
             col_map=col_map_areas,
             col_hits=col_hits_areas,
             rag_results=rag_results_areas,
@@ -2485,6 +3007,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         perq_proc = _build_per_question_report(
             PROCESSOS_QMAP, list(kw_hits_proc), seg_by_code_proc,
             llm_map_proc, llm_hits_proc,
+            qa_map=qa_map_proc,
+            qa_hits=qa_hits_proc,
+            qa_used_ids=qa_used_proc,
+            qa_reasons=qa_reason_proc,
             col_map=col_map_proc,
             col_hits=col_hits_proc,
             rag_results=rag_results_proc,
@@ -2493,18 +3019,31 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         perq_sist = _build_per_question_report(
             SISTEMAS_QMAP, list(kw_hits_sist), seg_by_code_sist,
             llm_map_sist, llm_hits_sist,
+            qa_map=qa_map_sist,
+            qa_hits=qa_hits_sist,
+            qa_used_ids=qa_used_sist,
+            qa_reasons=qa_reason_sist,
             col_map=col_map_sist,
             col_hits=col_hits_sist,
             rag_results=rag_results_sist,
         )
 
-        areas_final     = _compute_answered_from_per_question(perq_areas, 15)
-        processos_final = _compute_answered_from_per_question(perq_proc,  26)
-        sistemas_final  = _compute_answered_from_per_question(perq_sist,   5)
+        areas_final     = _compute_answered_from_per_question(perq_areas, 15, rag_primary=rag_primary)
+        processos_final = _compute_answered_from_per_question(perq_proc,  26, rag_primary=rag_primary)
+        sistemas_final  = _compute_answered_from_per_question(perq_sist,   5, rag_primary=rag_primary)
 
         missing_areas = [code for code, v in areas_final["by_code"].items() if v == 0]
         missing_proc  = [code for code, v in processos_final["by_code"].items() if v == 0]
         missing_sist  = [code for code, v in sistemas_final["by_code"].items() if v == 0]
+
+        for sec_name, sec_stats in (
+            ("areas", areas_final.get("guard_stats", {})),
+            ("processos", processos_final.get("guard_stats", {})),
+            ("sistemas", sistemas_final.get("guard_stats", {})),
+        ):
+            for metric_name, metric_count in (sec_stats or {}).items():
+                if int(metric_count or 0) > 0:
+                    logging.info("%s=%s section=%s", metric_name, int(metric_count), sec_name)
 
         logging.info("PERGUNTA-A-PERGUNTA AREAS: %s", json.dumps(perq_areas, ensure_ascii=False))
         logging.info("PERGUNTA-A-PERGUNTA PROCESSOS: %s", json.dumps(perq_proc, ensure_ascii=False))
@@ -2512,6 +3051,21 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logging.info("FALTANTES AREAS: %s", sorted(missing_areas))
         logging.info("FALTANTES PROCESSOS: %s", sorted(missing_proc))
         logging.info("FALTANTES SISTEMAS: %s", sorted(missing_sist))
+
+        for sec_name, perq in (
+            ("areas", perq_areas),
+            ("processos", perq_proc),
+            ("sistemas", perq_sist),
+        ):
+            for code, row in perq.items():
+                logging.info(
+                    "ANSWERABILITY TRACE: section=%s code=%s answerable=%s source=%s reason=%s",
+                    sec_name,
+                    code,
+                    row.get("answerable"),
+                    row.get("answerable_source"),
+                    row.get("reason"),
+                )
 
         rag_vs_old = {
             "areas": _compare_old_llm_vs_rag(AREAS_QMAP, llm_map_areas_old, rag_results_areas),
@@ -2521,7 +3075,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         rag_preview = {
             "enabled": bool(RAG_ENABLED),
-            "mode": "fill_missing_only" if RAG_ONLY_FILL_MISSING else "all_non_column",
+            "mode": "rag_primary" if rag_primary else ("fill_missing_only" if RAG_ONLY_FILL_MISSING else "all_non_column"),
+            "rag_primary": bool(rag_primary),
+            "has_structured_tables": bool(has_structured),
+            "qa_by_section": {
+                "areas": int((qa_based.get("areas", {}) or {}).get("answered", 0)),
+                "processos": int((qa_based.get("processos", {}) or {}).get("answered", 0)),
+                "sistemas": int((qa_based.get("sistemas", {}) or {}).get("answered", 0)),
+            },
             "top_k": RAG_TOP_K,
             "model": RAG_EVAL_MODEL,
             "rollout_stage": RAG_ROLLOUT_STAGE,
@@ -2551,6 +3112,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 },
             },
         }
+
+        retrieval_debug = {"areas": {}, "processos": {}, "sistemas": {}}
+        for sec_name, perq in (("areas", perq_areas), ("processos", perq_proc), ("sistemas", perq_sist)):
+            sec_dbg = retrieval_debug.setdefault(sec_name, {})
+            for code, row in (perq or {}).items():
+                rag_dbg = row.get("rag_retrieval_debug")
+                if rag_dbg:
+                    sec_dbg[code] = rag_dbg
 
         total_respondidas = (1 if organograma == "sim" else 0) + areas_final["answered"] + processos_final["answered"] + sistemas_final["answered"]
         total_perguntas  = 1 + areas_final["total"] + processos_final["total"] + sistemas_final["total"]
@@ -2586,6 +3155,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "debug": {
                 "use_llm": bool(USE_LLM_EVAL),
                 "len_text": len(text_norm),
+                "qa_blocks": {
+                    "found": len((structured or {}).get("qa_blocks", [])) if isinstance(structured, dict) else 0,
+                    "anchors_found": sorted(list(((structured or {}).get("qa_index", {}) or {}).keys()))[:40] if isinstance(structured, dict) else [],
+                },
                 "per_question": {
                     "areas": perq_areas,
                     "processos": perq_proc,
@@ -2596,8 +3169,15 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "processos": sorted(missing_proc),
                     "sistemas": sorted(missing_sist)
                 },
+                "guard": {
+                    "areas": dict(areas_final.get("guard_stats", {})),
+                    "processos": dict(processos_final.get("guard_stats", {})),
+                    "sistemas": dict(sistemas_final.get("guard_stats", {})),
+                },
                 "rag": {
                     "enabled": isinstance(rag_index, dict),
+                    "rag_primary": bool(rag_primary),
+                    "has_structured_tables": bool(has_structured),
                     "chunk_count": int((rag_index or {}).get("chunk_count", 0)) if isinstance(rag_index, dict) else 0,
                     "has_embeddings": bool((rag_index or {}).get("has_embeddings")) if isinstance(rag_index, dict) else False,
                     "embedding_provider": (rag_index or {}).get("embedding_provider") if isinstance(rag_index, dict) else None,
@@ -2616,6 +3196,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "old_llm_elapsed_ms": int(llm_old_elapsed_ms),
                 },
                 "rag_preview": rag_preview,
+                "retrieval": retrieval_debug,
                 "rag_applied_missing": {
                     "areas": int(rag_applied.get("areas", 0)),
                     "processos": int(rag_applied.get("processos", 0)),
