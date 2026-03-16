@@ -157,6 +157,16 @@ if RAG_ENABLED and not _RAG_CONFIG.get("config_ok", False):
 
 STRICT_MODE = os.getenv("STRICT_MODE", "true").lower() == "true"
 
+DM_MAX_FILE_SIZE_KB = int(os.getenv("DM_MAX_FILE_SIZE_KB", "20000"))
+DM_MAX_FILE_SIZE_BYTES = DM_MAX_FILE_SIZE_KB * 1024
+
+def _validate_uploaded_file_size(file_bytes: bytes | None, filename: str | None = None) -> None:
+    size = len(file_bytes or b"")
+    if size > DM_MAX_FILE_SIZE_BYTES:
+        raise ValueError(
+            f"O arquivo é grande demais. Envie um arquivo de no máximo {DM_MAX_FILE_SIZE_KB:,} KB.".replace(",", ".")
+        )
+
 def _normalize_text(value: str) -> str:
     if not value:
         return ""
@@ -553,25 +563,36 @@ def _detect_sensitive_data_usage(structured: dict | None) -> Dict[str, object]:
 def parse_multipart_formdata(req: func.HttpRequest):
     content_type = req.headers.get("Content-Type") or req.headers.get("content-type") or ""
     body = req.get_body()
+
     if "multipart/form-data" not in content_type:
         raise ValueError("Envie como multipart/form-data com arquivo (campo 'file').")
+
+    if cgi is None:
+        raise ValueError("O servidor não suporta leitura de multipart/form-data neste ambiente.")
+
     env = {
         "REQUEST_METHOD": "POST",
         "CONTENT_TYPE": content_type,
         "CONTENT_LENGTH": str(len(body))
     }
+
     fp = io.BytesIO(body)
     form = cgi.FieldStorage(fp=fp, environ=env, keep_blank_values=True)
+
     organograma = None
     if "organograma" in form and getattr(form["organograma"], "value", None):
         v = (form["organograma"].value or "").strip().lower()
-        organograma = "sim" if v in ("sim","yes","true","1") else ("nao" if v in ("nao","não","no","false","0") else None)
+        organograma = "sim" if v in ("sim", "yes", "true", "1") else ("nao" if v in ("nao", "não", "no", "false", "0") else None)
+
     if "file" not in form or not getattr(form["file"], "filename", None):
         raise ValueError("Arquivo não encontrado no form-data (campo 'file').")
+
     filename = form["file"].filename
     file_bytes = form["file"].file.read()
-    return organograma, filename, file_bytes
 
+    _validate_uploaded_file_size(file_bytes, filename)
+
+    return organograma, filename, file_bytes
 
 # -------------------------------------------------------
 # DefiniÃ§Ãµes das perguntas (cÃ³digos â†” textos humanos)
