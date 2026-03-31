@@ -56,6 +56,23 @@ class QaBlocksTests(unittest.TestCase):
         self.assertTrue(res["evidence"])
         self.assertTrue(res["used_chunk_ids"])
         self.assertTrue(res["used_chunk_ids"][0].startswith("qa:sistema_nome:"))
+    
+    def test_hd_armazenado_onde_nao_aceita_recomendacao_como_resposta(self) -> None:
+        qa_blocks = [
+            {
+                "anchor_id": "hd_armazenado_onde",
+                "anchor_text": "- Estabelecer um local seguro para armazenamento das cópias físicas de documentos",
+                "answer_text": "em armários ou arquivos protegidos por chave",
+                "confidence": 0.95,
+                "source": "pdf_raw_text",
+                "span": {"line_start": 1, "line_end": 2},
+            }
+        ]
+        qa_index = {"hd_armazenado_onde": [0]}
+
+        res = resolve_question_from_qa_blocks("1_2_hd_armazenado_onde", qa_blocks, qa_index)
+
+        self.assertEqual(res["answerable"], 0)
 
     def test_qa_rejects_answer_equal_to_anchor_header(self) -> None:
         qa_blocks = [

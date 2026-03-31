@@ -291,6 +291,9 @@ QUESTION_EXPLICIT_ANCHORS = {
     ],
     "8_finalidade_explicita_ao_titular": [
         "informada ao titular",
+        "informada para o titular",
+        "informada para o portador do dado",
+        "portador do dado",
         "ciencia do titular",
         "ciência do titular",
         "aviso de privacidade",
@@ -298,6 +301,11 @@ QUESTION_EXPLICIT_ANCHORS = {
         "finalidade informada",
         "finalidade explicita",
         "finalidade explícita",
+        "finalidade e explicita",
+        "finalidade é explícita",
+        "finalidade e explicita e informada",
+        "finalidade é explícita e informada",
+        "comunicar o titular sobre o tratamento realizado e a finalidade",
     ],
 }
 

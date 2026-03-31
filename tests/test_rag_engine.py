@@ -255,6 +255,50 @@ class RagEngineTests(unittest.TestCase):
         self.assertEqual(out["used_chunk_ids"], ["chunk-a"])
         self.assertTrue(out["evidence"])
 
+    def test_evaluate_questions_with_rag_identifies_detailed_treated_data_list(self) -> None:
+        index = {
+            "has_embeddings": True,
+            "chunks": [
+                RagChunk(
+                    "g1",
+                    "geral",
+                    "table:geral",
+                    "CONSIDERACOES: Neste processo foram identificados 13 tipos de dados sendo tratados.",
+                    {},
+                ),
+                RagChunk(
+                    "g2",
+                    "geral",
+                    "table:geral",
+                    "Detalhamento dos dados tratados | CPF | E-mail corporativo | Data de nascimento | Foto",
+                    {},
+                ),
+            ],
+            "embeddings": [[1.0, 0.0], [0.99, 0.01]],
+            "section_positions": {"geral": [0, 1]},
+            "question_sections": {"6_dados_tratados_quais": "processos"},
+            "question_keywords": {"6_dados_tratados_quais": QUESTION_KEYWORDS["6_dados_tratados_quais"]},
+            "_question_embedding_cache": {
+                "6_dados_tratados_quais::6- E informado quais dados sao tratados?": [1.0, 0.0]
+            },
+            "_embedding_client": None,
+            "embedding_model": None,
+        }
+        out = evaluate_questions_with_rag(
+            [("6_dados_tratados_quais", "6- E informado quais dados sao tratados?")],
+            index,
+            top_k=4,
+            batch_size=2,
+            max_context_chars=4000,
+            max_context_tokens=1000,
+        )
+        row = out["results"]["6_dados_tratados_quais"]
+        self.assertEqual(row["answerable"], 1)
+        self.assertEqual(row["reason"], "schema_table_value_present")
+        self.assertTrue(any("detalhamento dos dados tratados" in ev.lower() for ev in row["evidence"]))
+        self.assertEqual(row["used_chunk_ids"], ["g2"])
+        self.assertEqual(out["meta"]["schema_table_applied_total"], 1)
+
     def test_sanitize_legacy_mode_allows_auto_assign_chunk(self) -> None:
         os.environ["STRICT_MODE"] = "false"
         out = _sanitize_rag_json_response(

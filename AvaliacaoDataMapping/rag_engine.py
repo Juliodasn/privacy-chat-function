@@ -174,6 +174,43 @@ SCHEMA_TABLE_RULES: Dict[str, Dict[str, Any]] = {
         "header_optional": False,
         "min_tokens": 1,
     },
+    "6_dados_tratados_quais": {
+        "header_terms": [
+            "detalhamento dos dados tratados",
+            "dados tratados",
+            "descricao do dado",
+            "descrição do dado",
+            "dados coletados",
+            "dados utilizados",
+        ],
+        "value_terms": [
+            "cpf",
+            "nome",
+            "nome completo",
+            "email",
+            "e-mail",
+            "telefone",
+            "endereco",
+            "endereço",
+            "data de nascimento",
+            "foto",
+            "genero",
+            "gênero",
+            "estado civil",
+            "cargo",
+            "funcao",
+            "função",
+            "dados bancarios",
+            "dados bancários",
+            "voz",
+            "biometria",
+            "saude",
+            "saúde",
+        ],
+        "allow_text": True,
+        "header_optional": True,
+        "min_tokens": 2,
+    },
     "6_classificacao_documentos": {
         "header_terms": [
             "classificacao de documentos",
@@ -2048,7 +2085,7 @@ def evaluate_questions_with_rag(
         # FIX: algumas perguntas precisam de mais contexto porque o rerank pode
         # deixar de fora chunks que contêm a evidência (ex.: "E-mail", "Software", "API").
         per_question_top_k = top_k
-        if question_code in {"13_forma_transferencia_dados"}:
+        if question_code in {"13_forma_transferencia_dados", "6_dados_tratados_quais"}:
             per_question_top_k = max(int(top_k or 0), 8)
 
         retrieval_out = retrieve_context_for_question(

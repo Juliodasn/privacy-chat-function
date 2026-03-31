@@ -58,17 +58,23 @@ def _is_meaningful_answer(value: str, anchor_text: str = "") -> bool:
         return False
     if _ANSWER_EMPTY_RE.match(text):
         return False
+    if _looks_like_gap_or_task(text):
+        return False
     if looks_like_prompt(text, question_text=anchor_text):
         return False
     if text.endswith("?"):
         return False
+
     signal = normalize_text(text)
     if signal not in {"sim", "nao", "n/a"} and len(signal) < 3:
         return False
+
     if is_too_generic(text):
         return False
+
     if anchor_text and normalize_text(text) == normalize_text(anchor_text):
         return False
+
     return True
 
 
@@ -286,12 +292,20 @@ def resolve_question_from_qa_blocks(
             answer_text = _clean_answer_text(str(block.get("answer_text") or ""))
 
             candidate_text = (f"{anchor_text} {answer_text}".strip() or anchor_text).strip()
+            answer_payload = answer_text or candidate_text
 
-            if not _is_meaningful_answer(candidate_text, anchor_text=anchor_text):
+            # corta recomendações/gaps/tarefas, que não são resposta factual
+            if _looks_like_gap_or_task(anchor_text):
+                continue
+            if _looks_like_gap_or_task(candidate_text):
+                continue
+
+            # valida primeiro o payload da resposta, não "pergunta + resposta"
+            if not _is_meaningful_answer(answer_payload, anchor_text=anchor_text):
                 continue
 
             confidence = float(block.get("confidence", 0.0) or 0.0)
-            score = confidence + min(0.08, len(candidate_text) / 1000.0)
+            score = confidence + min(0.08, len(answer_payload) / 1000.0)
 
             candidates.append((score, idx, anchor_id, block))
 
@@ -311,7 +325,12 @@ def resolve_question_from_qa_blocks(
     for _, block_idx, anchor_id, block in candidates:
         anchor_text = str(block.get("anchor_text") or "").strip()
         answer_text = _clean_answer_text(str(block.get("answer_text") or ""))
-        evidence_text = (f"{anchor_text} {answer_text}".strip() or anchor_text or answer_text)[:240]
+
+        # evidência principal = resposta
+        # chunk completo = ancora + resposta (para permitir auto-repair quando necessário)
+        evidence_text = (answer_text or anchor_text)[:240]
+        chunk_payload = (f"{anchor_text} {answer_text}".strip() or anchor_text)[:500]
+
         used_chunk_id = f"qa:{anchor_id}:{block_idx}"
 
         validated_answerable, validated_reason, validated_evidence = validate_answerability(
@@ -319,7 +338,7 @@ def resolve_question_from_qa_blocks(
             answerable=1,
             evidence=[evidence_text],
             used_ids=[used_chunk_id],
-            chunk_texts={used_chunk_id: f"{anchor_text} {answer_text}".strip() or anchor_text},
+            chunk_texts={used_chunk_id: chunk_payload},
             question_text="",
         )
 

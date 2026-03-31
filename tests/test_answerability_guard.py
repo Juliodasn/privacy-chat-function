@@ -51,6 +51,36 @@ class AnswerabilityGuardTests(unittest.TestCase):
             (1, "auto_expanded_short_evidence", ["Forma de transferencia: E-mail"]),
         )
 
+    def test_explicit_purpose_to_data_subject_accepts_portador_variant(self) -> None:
+        out = validate_answerability(
+            question_code="8_finalidade_explicita_ao_titular",
+            answerable=1,
+            evidence=["A finalidade é explícita e informada para o portador do dado? Sim"],
+            used_ids=["chunk-a"],
+            chunk_texts={"chunk-a": "A finalidade é explícita e informada para o portador do dado? Sim"},
+            question_text="8- Se a finalidade é explícita e informada ao titular?",
+            strict_mode=True,
+        )
+        self.assertEqual(
+            out,
+            (1, "", ["A finalidade é explícita e informada para o portador do dado? Sim"]),
+        )
+
+    def test_explicit_purpose_to_data_subject_accepts_communication_variant(self) -> None:
+        out = validate_answerability(
+            question_code="8_finalidade_explicita_ao_titular",
+            answerable=1,
+            evidence=["indique que providências serão tomadas para comunicar o titular sobre o tratamento realizado e a finalidade"],
+            used_ids=["chunk-a"],
+            chunk_texts={"chunk-a": "indique que providências serão tomadas para comunicar o titular sobre o tratamento realizado e a finalidade"},
+            question_text="8- Se a finalidade é explícita e informada ao titular?",
+            strict_mode=True,
+        )
+        self.assertEqual(
+            out,
+            (1, "", ["indique que providências serão tomadas para comunicar o titular sobre o tratamento realizado e a finalidade"]),
+        )
+
     def test_explicit_questions_require_anchor_terms(self) -> None:
         out = validate_answerability(
             question_code="4_2_termo_sigilo_terceiros",
