@@ -317,7 +317,7 @@ _PERSONAL_ONLY_KEYWORDS = [
     "apenas dados pessoais",
     "only personal data",
 ]
-RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30")) # Limite de requisição
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "3")) # Limite de requisição
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", str(24 * 60 * 60)))
 
 _RATE_FILE = os.path.join(tempfile.gettempdir(), "pp_rate_limit.json")
